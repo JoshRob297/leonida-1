@@ -1828,16 +1828,49 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
-// A console descriptor heap carries a size as well as an address, and that size is 32 bytes per descriptor. A PC
-// desc's trailing words are whatever the caller holds next; they do not encode NumDescriptors * 32, so this
-// separates the two layouts without guessing anything about the address itself.
-static bool console_heap_range_plausible(const D3D12_DESCRIPTOR_HEAP_DESC* desc, std::uint64_t address,
-                                         std::uint64_t size) {
-    constexpr std::uint64_t kConsoleDescriptorSize = 32;
-    if (address == 0 || size == 0) return false;
-    if (desc->NumDescriptors == 0 || desc->NumDescriptors > (0xFFFFFFFFull / kConsoleDescriptorSize)) return false;
-    if (size != static_cast<std::uint64_t>(desc->NumDescriptors) * kConsoleDescriptorSize) return false;
+// True when every page of [address, address + bytes) is committed memory this process can write. VirtualQuery
+// answers per region, so a range that crosses regions is walked page by page; a hole or a read-only page rejects it.
+static bool committed_writable_range(std::uint64_t address, std::uint64_t bytes) {
+    if (address == 0 || bytes == 0) return false;
+    std::uint64_t cursor = address;
+    std::uint64_t remaining = bytes;
+    while (remaining) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<std::uintptr_t>(cursor)), &mbi, sizeof(mbi)))
+            return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        const DWORD protect = mbi.Protect & 0xffu;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY) return false;
+        const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const auto here = static_cast<std::uintptr_t>(cursor);
+        const std::uint64_t avail = static_cast<std::uint64_t>(base + mbi.RegionSize - here);
+        if (avail == 0) return false;
+        if (avail >= remaining) return true;
+        remaining -= avail;
+        cursor += avail;
+    }
     return true;
+}
+
+// Console-extended slot 14 (issue #313): address and size follow the 16-byte PC description. The words after a PC
+// desc are not evidence of that layout - they are whatever the caller holds next, almost always readable and
+// non-zero, and a one-descriptor heap followed by (1, 32) even agrees with "NumDescriptors * 32". So the decision is
+// made on the memory the range names, which is the positive property of the console layout: it is the title's own
+// committed, writable backing for NumDescriptors descriptors of this heap type. A range that is not, falls through
+// to the PC path as if the desc had no console trailer at all.
+static bool console_heap_range_plausible(const D3D12_DESCRIPTOR_HEAP_DESC* desc, UINT increment,
+                                         std::uint64_t address, std::uint64_t size) {
+    // A console descriptor VA is a user-mode address the title owns; the null page and kernel space are not.
+    constexpr std::uint64_t kMinConsoleAddress = 0x10000;
+    constexpr std::uint64_t kMaxUserAddress = 0x0000800000000000ull;
+    if (address < kMinConsoleAddress || address >= kMaxUserAddress) return false;
+    const std::uint64_t descriptor_size = increment ? increment : 32;
+    if (desc->NumDescriptors == 0 || desc->NumDescriptors > (0xFFFFFFFFFFFFFFFFull / descriptor_size)) return false;
+    const std::uint64_t expected = static_cast<std::uint64_t>(desc->NumDescriptors) * descriptor_size;
+    // A console caller may leave the size unset; when it states one it has to be the heap's size.
+    if (size != 0 && size != expected) return false;
+    if (address > 0xFFFFFFFFFFFFFFFFull - expected) return false;
+    return committed_writable_range(address, expected);
 }
 
 static bool readable_range(const void* ptr, std::size_t bytes) {
@@ -1879,14 +1912,18 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. A non-zero word is not evidence
-            // of that layout - the bytes after a PC desc are whatever the caller holds next, and they are almost
-            // always readable and non-zero. The size has to agree with the descriptor count for the path to be taken.
-            if (console_heap_range_plausible(desc, address, size)) {
+            // Console-extended slot 14 (issue #313): address/size follow the PC desc. The layout is taken only for a
+            // range the title committed and can write (see console_heap_range_plausible); otherwise this call is
+            // treated as a plain PC description and no console address is applied.
+            const UINT increment = self->real->GetDescriptorHandleIncrementSize(desc->Type);
+            if (console_heap_range_plausible(desc, increment, address, size)) {
                 const ConsoleDescriptorHeapHandler handler =
                     g_console_descriptor_heap.load(std::memory_order_acquire);
                 if (handler) {
                     console_extended = true;
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: descriptor heap takes the console address 0x%llx (size %llu)\n",
+                                 static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
                     hr = handler(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                                  __uuidof(ID3D12DescriptorHeap), &created);
                 }

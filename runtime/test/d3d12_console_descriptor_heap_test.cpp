@@ -73,6 +73,19 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
         return false;
     }
 
+    // Slot 14 now takes the console layout only when the range it names is memory the title committed and can
+    // write, so the test hands it a real range rather than an unmapped constant. The handler reports this address
+    // as the heap start; nothing writes through it.
+    void* console_memory = VirtualAlloc(nullptr, 64 * 1024, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!console_memory) {
+        std::fprintf(stderr, "VirtualAlloc(console range) failed: %lu\n", static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    struct ConsoleMemory {
+        void* p;
+        ~ConsoleMemory() { if (p) VirtualFree(p, 0, MEM_RELEASE); }
+    } console_owner{console_memory};
+
     struct ConsoleDescriptorHeapDesc {
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
         std::uint64_t address = 0;
@@ -81,7 +94,7 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     console.desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     console.desc.NumDescriptors = 4;
     console.desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    console.address = 0x556677880000ull;
+    console.address = reinterpret_cast<std::uint64_t>(console_memory);
     console.size = 4ull * 32ull;
 
     Ref<ID3D12DescriptorHeap> heap;
@@ -103,6 +116,33 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
                      static_cast<unsigned long long>(cpu.ptr),
                      static_cast<unsigned long long>(console.address));
+        return false;
+    }
+
+    // Issue #3 / #1148: a plain PC one-descriptor heap followed by the words (1, 32) used to satisfy a size-only
+    // guard and send GetCPUDescriptorHandleForHeapStart() to address 1. It must reach the PC path now.
+    struct PcHeapDescWithTail {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        std::uint64_t address = 1;
+        std::uint64_t size = 32;
+    } pc{};
+    pc.desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    pc.desc.NumDescriptors = 1;
+    Ref<ID3D12DescriptorHeap> pc_heap;
+    const HRESULT pc_hr = proxy->CreateDescriptorHeap(&pc.desc, IID_PPV_ARGS(pc_heap.put()));
+    if (FAILED(pc_hr) || !pc_heap.get()) {
+        std::fprintf(stderr, "proxy CreateDescriptorHeap(PC desc with tail) failed: 0x%08lx\n",
+                     static_cast<unsigned long>(pc_hr));
+        return false;
+    }
+    ID3D12DescriptorHeap* pc_real = rt::d3d12_xs::heap_proxy_real_heap(pc_heap.p);
+    if (!pc_real) {
+        std::fprintf(stderr, "PC heap proxy has no real heap\n");
+        return false;
+    }
+    const auto pc_cpu = pc_real->GetCPUDescriptorHandleForHeapStart();
+    if (pc_cpu.ptr == 1) {
+        std::fprintf(stderr, "PC desc with (1, 32) tail took the console layout: CPU start 0x1\n");
         return false;
     }
     return true;
