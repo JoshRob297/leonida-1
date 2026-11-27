@@ -241,6 +241,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
     shims/xbox_bvh_builder.cpp
+    shims/stop_dump.cpp
+    shims/probe.cpp
     shims/library_loader.cpp
     shims/process.cpp
     shims/lifecycle.cpp

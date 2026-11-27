@@ -38,6 +38,12 @@
 
 #include <cstring>
 
+namespace rt::diag {
+void install_terminate_trace();
+void install_stop_dump(void* base, size_t size);
+void install_probe(void* base, size_t size);
+}  // namespace rt::diag
+
 namespace {
 
 // The retail title runs a hang watchdog thread: when the game's main loop has not set its "kick" byte for 30
@@ -671,6 +677,9 @@ int wmain(int argc, wchar_t** argv) {
         start_title_peek(main_module.base);
         leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
         leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
+        rt::diag::install_terminate_trace();                                  // reason and stack on std::terminate
+        rt::diag::install_stop_dump(main_module.base, main_module.size);       // LEONIDA_STOP_DUMP=<file>
+        rt::diag::install_probe(main_module.base, main_module.size);           // LEONIDA_PROBE=<rva>[,...]
 #ifdef LEONIDA_VULKAN_DEVICE
         SetConsoleCtrlHandler(&stop_compiles_on_console_exit, TRUE);
         previous_fatal_filter = SetUnhandledExceptionFilter(&save_caches_on_fatal_exception);
