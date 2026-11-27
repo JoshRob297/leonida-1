@@ -6077,18 +6077,39 @@ HRESULT proxy_create_placed_resource_slot133(DeviceProxy* self, std::uint64_t va
     return proxy_create_placed_resource_x(self, va, xbox_desc, state, clear_value, riid, out);
 }
 
-// Slot 74: the retail title calls it once with (pointer, u32, pointer) (kapitche, issue 7231). The PC slot 74 is
-// ID3D12Device9::ShaderCacheControl(kinds, control), which reads the first word as a flags value and returns
-// E_INVALIDARG, and the title then stops on an int3. The words are not measured: nothing is written through the
-// pointers, the PC device is not called, and the call succeeds. Only for the title's calls (set_console_caller, as
+// Slot 74: the retail title calls it once with (va, pages, u32* index) (kapitche, issue 7231; the shape is also the
+// sibling layer's RegisterPagePoolX). The PC slot 74 is ID3D12Device9::ShaderCacheControl(kinds, control), which reads
+// the first word as a flags value and returns E_INVALIDARG, and the title then stops on an int3. The title hands the
+// GPU-readable range as a title address and a page count in 4 KiB pages, and reads back an index; a sibling layer
+// keeps the same table and hands out a stable, deduplicated index. Only for the title's calls (set_console_caller, as
 // slot 61): a host caller of ID3D12Device9::ShaderCacheControl through the proxy gets the PC method.
 std::uint64_t proxy_slot74(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3) {
+    static std::mutex mutex;
+    static std::vector<std::pair<std::uint64_t, std::uint32_t>> pools;  // (address, pages)
     static std::atomic<bool> logged{false};
+    const auto va = static_cast<std::uint64_t>(a1);
+    const auto pages = static_cast<std::uint32_t>(a2);
+    std::size_t index = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        index = pools.size();
+        for (std::size_t i = 0; i < pools.size(); ++i) {
+            if (pools[i].first == va && pools[i].second == pages) {
+                index = i;  // registering the same range twice keeps the same index
+                break;
+            }
+        }
+        if (index == pools.size()) pools.emplace_back(va, pages);
+    }
+    // The third word is the index out-pointer. Nothing else is written and the PC device is not called.
+    if (a3) *reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(a3)) = static_cast<std::uint32_t>(index);
     bool expected = false;
     if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 74 (pointer, u32, pointer) returns S_OK; words 0x%llx 0x%llx 0x%llx\n",
-                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                     static_cast<unsigned long long>(a3));
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 74 page pool %zu: va=%p pages=%u (%llu MiB); index written to %p\n", index,
+                     reinterpret_cast<void*>(static_cast<std::uintptr_t>(va)), pages,
+                     static_cast<unsigned long long>(pages) * 4096ull / (1024ull * 1024ull),
+                     reinterpret_cast<void*>(static_cast<std::uintptr_t>(a3)));
     return hr_to_u64(S_OK);
 }
 
